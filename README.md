@@ -40,8 +40,9 @@ python main.py \
 
 ### Python / Notebook usage
 ```python
+from pathlib import Path
 from tagger import BioPortalClient, OntologyTagger
-from utils import get_api_key, outcomes_to_json
+from utils import get_api_key, outcomes_to_json, save_json_output
 
 client = BioPortalClient(api_key=get_api_key())
 tagger = OntologyTagger(client)
@@ -72,6 +73,14 @@ outcomes = tagger.annotate_terms(
     on_version_missing="latest",
 )
 print(outcomes_to_json(outcomes))
+
+# Save results to a JSON file
+outcomes = tagger.annotate_terms(
+    ontology="CL",
+    terms=["melanocyte", "keratinocyte"],
+    version="2025-10-16",
+)
+save_json_output(outcomes, Path("results.json"))
 ```
 
 ### Behavior summary
@@ -82,7 +91,7 @@ print(outcomes_to_json(outcomes))
 
 ### Files of interest
 - `tagger.py`: BioPortal client, download, annotation orchestration, version checks.
-- `utils.py`: env/key loading, normalization, JSON helpers.
+- `utils.py`: env/key loading, normalization, JSON helpers (including `save_json_output` for saving results to files).
 - `const.py`: base URL, env var name, default download dir.
 - `main.py`: CLI entry point.
 

@@ -82,6 +82,36 @@ def outcomes_to_json(outcomes: Sequence[object]) -> str:
     return json.dumps(serialized, indent=2)
 
 
+def save_json_output(
+    outcomes: Sequence[object], file_path: pathlib.Path, indent: int = 2
+) -> None:
+    """
+    Save the JSON output of the tagger to a JSON file.
+
+    Args:
+        outcomes: Sequence of outcomes (AnnotationOutcome objects or dictionaries)
+        file_path: Path where the JSON file should be saved
+        indent: JSON indentation level (default: 2)
+    """
+    serialized: List[Dict[str, Optional[str]]] = []
+    for outcome in outcomes:
+        if hasattr(outcome, "to_dict"):
+            serialized.append(outcome.to_dict())
+        elif isinstance(outcome, dict):
+            serialized.append(outcome)  # type: ignore[arg-type]
+        else:
+            raise TypeError(
+                "save_json_output expects items with to_dict() or dictionaries."
+            )
+    
+    # Create parent directories if they don't exist
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write JSON to file
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(serialized, f, indent=indent, ensure_ascii=False)
+
+
 __all__ = [
     "build_opener",
     "get_api_key",
@@ -89,5 +119,6 @@ __all__ = [
     "load_env_once",
     "normalize_terms",
     "outcomes_to_json",
+    "save_json_output",
 ]
 
