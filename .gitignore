@@ -1,0 +1,5 @@
+ontology_tagger.ipynb
+.env
+__pycache__/*
+downloads/*
+*.pyc
