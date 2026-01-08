@@ -163,6 +163,7 @@ class OwlLexicon:
 
         self._labels = set()
         self._ids = set()
+        self._id_to_label = {}
         graph = rdflib.Graph()
         try:
             graph.parse(str(owl_path))
@@ -174,10 +175,27 @@ class OwlLexicon:
                 "verify the version exists and the download link is correct."
             ) from exc
 
-        for _, _, obj in graph.triples((None, rdflib.RDFS.label, None)):
-            label = str(obj).strip().lower()
-            if label:
-                self._labels.add(label)
+        # First pass: Collect all labels for subjects
+        # We want to map ID -> Label.
+        # IDs are derived from the Subject URI.
+        for subj, _, obj in graph.triples((None, rdflib.RDFS.label, None)):
+            label = str(obj).strip()
+            if not label:
+                continue
+            
+            # Add to labels set for forward check
+            self._labels.add(label.lower())
+            
+            # Map ID to Label
+            if isinstance(subj, rdflib.term.URIRef):
+                ident = str(subj)
+                # Logic to extract short_id must match what we do in OntologyTagger
+                short_id = ident.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+                # Store the original case label for the ID
+                # If multiple labels exist, this simple approach takes the last one visited.
+                # Ideally we might want 'prefLabel' but typical OWL uses rdfs:label.
+                self._id_to_label[short_id.lower()] = label
+
         for subj, _, _ in graph.triples((None, None, None)):
             if isinstance(subj, rdflib.term.URIRef):
                 ident = str(subj)
@@ -189,6 +207,12 @@ class OwlLexicon:
 
     def has_id(self, ident: str) -> bool:
         return ident.lower().strip() in self._ids
+    
+    def get_label_by_id(self, ident: str) -> Optional[str]:
+        """
+        Reverse lookup: Get the label for a given ontology ID (case-insensitive on ID).
+        """
+        return self._id_to_label.get(ident.lower().strip())
 
 
 @dataclass
@@ -297,12 +321,26 @@ class OntologyTagger:
                 short_id = ontology_uri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
             ontology_id = short_id
 
+            # Reverse lookup and verification
             in_specified_version = False
+            owl_label = None
+            
             if owl_lexicon:
                 if short_id:
                     in_specified_version = owl_lexicon.has_id(short_id)
+                    # Attempt to get the label from the OWL file if we have the ID
+                    if in_specified_version:
+                        owl_label = owl_lexicon.get_label_by_id(short_id)
+                
                 if not in_specified_version and pref_label:
                     in_specified_version = owl_lexicon.has_label(pref_label)
+                    # If we matched by label but not ID (rare if ID is missing), 
+                    # we essentially trust pref_label is correct for that version 
+                    # or implies the concept exists.
+
+            # If we found a label in the OWL file, prioritize it as the standardized term
+            # This fixes the issue where BioPortal might return null or we want the exact OWL string.
+            final_standardized_term = owl_label if owl_label else pref_label
 
             if version and not version_fallback and in_specified_version:
                 ont_version = resolved_version or version
@@ -332,7 +370,7 @@ class OntologyTagger:
             outcomes.append(
                 AnnotationOutcome(
                     input_text=term,
-                    standardized_term=pref_label,
+                    standardized_term=final_standardized_term,
                     ontology_id=ontology_id,
                     ontology_version=ont_version,
                     comment=comment,
