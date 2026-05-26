@@ -3,3 +3,4 @@ ontology_tagger.ipynb
 __pycache__/*
 downloads/*
 *.pyc
+.claude/
