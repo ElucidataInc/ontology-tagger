@@ -61,7 +61,13 @@ class BioPortalClient:
     def annotate_text(
         self, text: str, ontology: str, extra_params: Optional[Dict[str, str]] = None
     ):
-        params = {"text": text, "ontologies": ontology}
+        params = {
+            "text": text,
+            "ontologies": ontology,
+            "longest_only": "true",
+            "whole_word_only": "true",
+            "minimum_match_length": "3",
+        }
         if extra_params:
             params.update(extra_params)
         return json_get(self._opener, self._url("/annotator", params))
@@ -124,10 +130,12 @@ class BioPortalClient:
             timeout=30,
         )
         resp.raise_for_status()
-        
+
         # Verify we got OWL/RDF content, not JSON metadata
         content_type = resp.headers.get("Content-Type", "").lower()
-        if "json" in content_type or (len(resp.content) > 0 and resp.content[:1] == b"{"):
+        if "json" in content_type or (
+            len(resp.content) > 0 and resp.content[:1] == b"{"
+        ):
             raise ValueError(
                 f"Downloaded JSON metadata instead of OWL file. "
                 f"URL: {final_url}\n"
@@ -136,7 +144,7 @@ class BioPortalClient:
                 f"Version: {resolved_version}\n"
                 f"First 200 bytes: {resp.content[:200].decode(errors='replace')}"
             )
-        
+
         dest_path.write_bytes(resp.content)
 
         return dest_path, resolved_version
@@ -147,7 +155,7 @@ class OwlLexicon:
     Simple label index built from an OWL file to verify term presence.
     """
 
-    def __init__(self, owl_path: pathlib.Path):
+    def __init__(self, owl_path: pathlib.Path, ontology_acronym: str):
         try:
             import rdflib  # type: ignore[import-unresolved]
             from rdflib import (  # type: ignore[import-unresolved]
@@ -164,6 +172,8 @@ class OwlLexicon:
         self._labels = set()
         self._ids = set()
         self._id_to_label = {}
+        self._id_to_synonyms: Dict[str, List[str]] = {}
+        self._acronym_prefix = f"{ontology_acronym.lower()}_"
         graph = rdflib.Graph()
         try:
             graph.parse(str(owl_path))
@@ -182,37 +192,70 @@ class OwlLexicon:
             label = str(obj).strip()
             if not label:
                 continue
-            
-            # Add to labels set for forward check
-            self._labels.add(label.lower())
-            
-            # Map ID to Label
+
+            # Map ID to Label — only for subjects native to this ontology.
             if isinstance(subj, rdflib.term.URIRef):
                 ident = str(subj)
                 # Logic to extract short_id must match what we do in OntologyTagger
                 short_id = ident.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
-                # Store the original case label for the ID
-                # If multiple labels exist, this simple approach takes the last one visited.
-                # Ideally we might want 'prefLabel' but typical OWL uses rdfs:label.
-                self._id_to_label[short_id.lower()] = label
+                if short_id.lower().startswith(self._acronym_prefix):
+                    self._labels.add(label.lower())
+                    self._id_to_label[short_id.lower()] = label
 
         for subj, _, _ in graph.triples((None, None, None)):
             if isinstance(subj, rdflib.term.URIRef):
                 ident = str(subj)
                 short_id = ident.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
-                self._ids.add(short_id.lower())
+                if short_id.lower().startswith(self._acronym_prefix):
+                    self._ids.add(short_id.lower())
+
+        # Synonym predicates used in OBO-style ontologies (CL, GO, UBERON, etc.).
+        syn_predicates = [
+            rdflib.URIRef(
+                "http://www.geneontology.org/formats/oboInOwl#hasExactSynonym"
+            ),
+            rdflib.URIRef(
+                "http://www.geneontology.org/formats/oboInOwl#hasRelatedSynonym"
+            ),
+            rdflib.URIRef(
+                "http://www.geneontology.org/formats/oboInOwl#hasNarrowSynonym"
+            ),
+            rdflib.URIRef(
+                "http://www.geneontology.org/formats/oboInOwl#hasBroadSynonym"
+            ),
+        ]
+        for pred in syn_predicates:
+            for subj, _, obj in graph.triples((None, pred, None)):
+                if not isinstance(subj, rdflib.term.URIRef):
+                    continue
+                ident = str(subj)
+                short_id = ident.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
+                if not short_id.lower().startswith(self._acronym_prefix):
+                    continue
+                syn = str(obj).strip()
+                if not syn:
+                    continue
+                bucket = self._id_to_synonyms.setdefault(short_id.lower(), [])
+                if syn not in bucket:
+                    bucket.append(syn)
 
     def has_label(self, label: str) -> bool:
         return label.lower().strip() in self._labels
 
     def has_id(self, ident: str) -> bool:
         return ident.lower().strip() in self._ids
-    
+
     def get_label_by_id(self, ident: str) -> Optional[str]:
         """
         Reverse lookup: Get the label for a given ontology ID (case-insensitive on ID).
         """
         return self._id_to_label.get(ident.lower().strip())
+
+    def get_synonyms_by_id(self, ident: str) -> List[str]:
+        """
+        Return all OWL synonyms (exact/related/narrow/broad) for an ID.
+        """
+        return list(self._id_to_synonyms.get(ident.lower().strip(), []))
 
 
 @dataclass
@@ -222,14 +265,20 @@ class AnnotationOutcome:
     ontology_id: Optional[str]
     ontology_version: Optional[str]
     comment: str
+    matched_text: Optional[str] = None
+    match_type: Optional[str] = None
+    synonyms: Optional[List[str]] = None
 
-    def to_dict(self) -> Dict[str, Optional[str]]:
+    def to_dict(self) -> Dict[str, object]:
         return {
             "input_text": self.input_text,
             "standardized_term": self.standardized_term,
             "ontology_id": self.ontology_id,
             "ontology_version": self.ontology_version,
             "comment": self.comment,
+            "matched_text": self.matched_text,
+            "match_type": self.match_type,
+            "synonyms": self.synonyms,
         }
 
 
@@ -246,6 +295,70 @@ class OntologyTagger:
     ):
         self.client = client
         self.downloads_dir = downloads_dir
+
+    @staticmethod
+    def _pick_best_annotation(
+        annotations: Sequence[Dict], ontology: str
+    ) -> Optional[Dict]:
+        """
+        Pick the annotation that (a) belongs to the requested ontology and
+        (b) covers the longest input span. Tie-break by matchType: PREF
+        (matched on prefLabel) beats SYN (matched on synonym) so that, e.g.,
+        "macrophage" prefers the class whose prefLabel is "macrophage" over
+        one where "macrophage" is only a synonym.
+        """
+        acronym_suffix = f"/{ontology.lower()}"
+        best = None
+        best_key: Tuple[int, int] = (-1, 0)
+        for ann in annotations:
+            class_details = ann.get("annotatedClass", {}) or {}
+            links = class_details.get("links", {}) or {}
+            ontology_link = str(links.get("ontology") or "").rstrip("/").lower()
+            if not ontology_link.endswith(acronym_suffix):
+                continue
+            span = 0
+            is_pref = 0
+            for inner in ann.get("annotations", []) or []:
+                try:
+                    span = max(span, int(inner["to"]) - int(inner["from"]) + 1)
+                except (KeyError, TypeError, ValueError):
+                    pass
+                if str(inner.get("matchType", "")).upper() == "PREF":
+                    is_pref = 1
+            key = (span, is_pref)
+            if key > best_key:
+                best_key = key
+                best = ann
+        return best
+
+    @staticmethod
+    def _summarize_inner_match(
+        annotation: Dict,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Return (matched_text, match_type) from the best inner annotation —
+        longest span wins, with PREF preferred on ties.
+        """
+        best_inner = None
+        best_key: Tuple[int, int] = (-1, 0)
+        for inner in annotation.get("annotations", []) or []:
+            try:
+                span = int(inner["to"]) - int(inner["from"]) + 1
+            except (KeyError, TypeError, ValueError):
+                span = 0
+            is_pref = 1 if str(inner.get("matchType", "")).upper() == "PREF" else 0
+            key = (span, is_pref)
+            if key > best_key:
+                best_key = key
+                best_inner = inner
+        if not best_inner:
+            return None, None
+        matched_text = best_inner.get("text")
+        match_type = best_inner.get("matchType")
+        return (
+            str(matched_text) if matched_text is not None else None,
+            str(match_type).upper() if match_type is not None else None,
+        )
 
     def annotate_terms(
         self,
@@ -269,7 +382,9 @@ class OntologyTagger:
             return []
 
         submissions = self.client.list_submissions(ontology)
-        latest_version = str(submissions[0].get("version") or "latest") if submissions else "latest"
+        latest_version = (
+            str(submissions[0].get("version") or "latest") if submissions else "latest"
+        )
 
         owl_path: Optional[pathlib.Path] = None
         resolved_version: Optional[str] = None
@@ -277,7 +392,9 @@ class OntologyTagger:
         version_fallback = False
 
         if version:
-            matches = [sub for sub in submissions if str(sub.get("version") or "") == version]
+            matches = [
+                sub for sub in submissions if str(sub.get("version") or "") == version
+            ]
             if not matches:
                 if on_version_missing == "latest":
                     version_fallback = True
@@ -291,7 +408,7 @@ class OntologyTagger:
                 owl_path, resolved_version = self.client.download_submission(
                     ontology, version, self.downloads_dir
                 )
-                owl_lexicon = OwlLexicon(owl_path)
+                owl_lexicon = OwlLexicon(owl_path, ontology)
         else:
             # No version provided; operate on latest without lexicon verification.
             resolved_version = None
@@ -312,7 +429,18 @@ class OntologyTagger:
                 )
                 continue
 
-            top = annotations[0]
+            top = self._pick_best_annotation(annotations, ontology)
+            if top is None:
+                outcomes.append(
+                    AnnotationOutcome(
+                        input_text=term,
+                        standardized_term=None,
+                        ontology_id=None,
+                        ontology_version=None,
+                        comment="not matched in requested ontology",
+                    )
+                )
+                continue
             class_details = top.get("annotatedClass", {})
             pref_label = class_details.get("prefLabel")
             ontology_uri = class_details.get("@id")
@@ -321,21 +449,25 @@ class OntologyTagger:
                 short_id = ontology_uri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
             ontology_id = short_id
 
+            matched_text, match_type = self._summarize_inner_match(top)
+
             # Reverse lookup and verification
             in_specified_version = False
             owl_label = None
-            
+            synonyms: Optional[List[str]] = None
+
             if owl_lexicon:
                 if short_id:
                     in_specified_version = owl_lexicon.has_id(short_id)
                     # Attempt to get the label from the OWL file if we have the ID
                     if in_specified_version:
                         owl_label = owl_lexicon.get_label_by_id(short_id)
-                
+                        synonyms = owl_lexicon.get_synonyms_by_id(short_id) or None
+
                 if not in_specified_version and pref_label:
                     in_specified_version = owl_lexicon.has_label(pref_label)
-                    # If we matched by label but not ID (rare if ID is missing), 
-                    # we essentially trust pref_label is correct for that version 
+                    # If we matched by label but not ID (rare if ID is missing),
+                    # we essentially trust pref_label is correct for that version
                     # or implies the concept exists.
 
             # If we found a label in the OWL file, prioritize it as the standardized term
@@ -360,6 +492,9 @@ class OntologyTagger:
                             ontology_id=ontology_id,
                             ontology_version=resolved_version or version,
                             comment="strict mode: not matched in specified version",
+                            matched_text=matched_text,
+                            match_type=match_type,
+                            synonyms=synonyms,
                         )
                     )
                     continue
@@ -374,6 +509,9 @@ class OntologyTagger:
                     ontology_id=ontology_id,
                     ontology_version=ont_version,
                     comment=comment,
+                    matched_text=matched_text,
+                    match_type=match_type,
+                    synonyms=synonyms,
                 )
             )
 
@@ -386,4 +524,3 @@ __all__ = [
     "OntologyTagger",
     "OntologyVersionNotFound",
 ]
-
